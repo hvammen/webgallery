@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!@PERL_EXECUTABLE@ -w
 #
 #    Webgallery: a program to create thumbnails and HTML from images.
 #    Copyright (C) 2000, 2001  Adam Goode
@@ -70,7 +70,7 @@ $index_file = "index.html";
 &print_banner;
 
 # theme is "Default" as default
-$theme = "Default";
+$theme = "webgallery";
 
 # get the options
 $verbose = 0;
@@ -118,7 +118,7 @@ if (@ARGV == 0) {
 # find the theme files, make sure it's valid
 {
     my $run_dir = File::Spec->rel2abs((File::Spec->splitpath($0))[1]);
-    my $theme_dir = "/usr/local/lib/webgallery/themes/$theme";
+    my $theme_dir = "@CMAKE_INSTALL_PREFIX@/lib/$theme";
     unless (-f "$theme_dir/$index_files{top}" &&
 	    -f "$theme_dir/$index_files{bot}" &&
 	    -f "$theme_dir/$index_files{pic}" &&
