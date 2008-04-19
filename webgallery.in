@@ -48,6 +48,7 @@ $index_file = "index.html";
 		 ".ps"  => "PostScript",
 		 ".dvi" => "DeVice Independent Format",
 		 ".txt" => "Plain Text",
+		 ".thm" => "AVI movie tumb",
 		 ".html"=> "HyperText Markup Language",
 		 ".htm"=> "HyperText Markup Language");
 
@@ -743,9 +744,10 @@ sub write_index ($$$$$$@) {
 
 	    # insert HTML code that links directly to some files
 	    if (defined $direct_links{lc($rfext)}) {
-		s/#THUMBNAIL#/<a href="$uri_rf">
+		s/#THUMBNAIL#/<a href="$rf">
 		    <img src="$thumbdir\/$uri" height=120 alt="$rf" \/><\/a>/g;
-		s/#THUMBNAIL_LINK#/$uri_rf/g;
+		s/#THUMBNAIL_LINK#/$uri/g;
+                s/thm\"\>/avi\"\>/g
 	    }
 	    else {
 		s/#THUMBNAIL#/<a href="$thumbdir\/$uri_html">
