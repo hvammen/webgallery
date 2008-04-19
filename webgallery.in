@@ -1,0 +1,918 @@
+#!/usr/bin/perl -w
+#
+#    Webgallery: a program to create thumbnails and HTML from images.
+#    Copyright (C) 2000, 2001  Adam Goode
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, write to the Free Software
+#    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+#
+#    You can contact the author at his email address: adam@evdebs.org
+#
+
+use Image::Magick;
+use Getopt::Long;
+use URI;
+use File::Copy;
+use File::Spec 0.8;
+use strict;
+
+# some constants
+use vars qw($my_name $my_version $thumbdir $html_title
+	    $theme $index_file $verbose %index_files
+	    %skip_files %direct_links $server
+	    $output_dir $strip_level $quality);
+$my_name = "Webgallery";
+$my_version = "1.2.1";
+$thumbdir = "thumbnails";        # assumed to not need URI escaping
+$index_file = "index.html";
+%index_files = ("top"   => "index_top.html",       # gphoto theme files
+		"bot"   => "index_bottom.html",
+		"pic"   => "picture.html",
+		"thumb" => "thumbnail.html");
+
+# files to link to directly, instead of making an HTML page
+%direct_links = (".eps" => "Encapsulated PostScript",
+		 ".pdf" => "Portable Document Format",
+		 ".ps"  => "PostScript",
+		 ".dvi" => "DeVice Independent Format",
+		 ".txt" => "Plain Text",
+		 ".html"=> "HyperText Markup Language",
+		 ".htm"=> "HyperText Markup Language");
+
+# files to skip
+%skip_files = (".wav" => "WAVE Audio",
+	       ".txt" => "Plain Text",
+	       ".ps"  => "PostScript",
+	       ".pdf" => "Portable Document Format",
+	       ".dvi" => "DeVice Independent Format",
+	       ".avi" => "Audio Video Interleaved",
+	       ".html" => "HyperText Markup Language",
+	       ".htm" => "HyperText Markup Language");
+
+####################
+# start doing things
+####################
+
+# print banner
+&print_banner;
+
+# theme is "Default" as default
+$theme = "Default";
+
+# get the options
+$verbose = 0;
+$quality = 50;
+$strip_level = 0;
+my $quiet = 0;
+my $recurse;
+my $recurse_level;
+
+unless (GetOptions("v+"  => \$verbose,
+		   "q+"  => \$quiet,
+		   "r"   => \$recurse,     # sets verbosity and recursion
+		   "l=i" => \$recurse_level,
+		   "t=s"  => \$theme,
+		   "o=s" => \$output_dir,
+		   "s=s" => \$server,
+		   "p=i" => \$strip_level,
+		   "b=i" => \$quality)) {
+    &usage;
+}
+
+$verbose -= $quiet;
+
+# -r = recursion on, -l n sets recursion to level n (10 by default)
+if (defined $recurse) {
+    unless (defined $recurse_level) {
+	$recurse_level = 10;
+    }
+    if ($recurse_level < 0) {
+	$recurse_level = 0;
+    }
+}
+else {
+    $recurse_level = 0;
+}
+
+
+
+
+# check count of directory names
+if (@ARGV == 0) {
+    &usage;
+}
+
+# find the theme files, make sure it's valid
+{
+    my $run_dir = File::Spec->rel2abs((File::Spec->splitpath($0))[1]);
+    my $theme_dir = "/usr/local/lib/webgallery/themes/$theme";
+    unless (-f "$theme_dir/$index_files{top}" &&
+	    -f "$theme_dir/$index_files{bot}" &&
+	    -f "$theme_dir/$index_files{pic}" &&
+	    -f "$theme_dir/$index_files{thumb}") {
+	die "Cannot find theme files in $theme_dir";
+    }
+    $theme = $theme_dir;      # check is good, update global variable
+
+    # find the "other" files
+    opendir THEME_DIR, $theme or die "Can't open $theme: $!";
+    my @theme_files = grep (-f "$theme/$_"
+			    && $_ ne $index_files{top}
+			    && $_ ne $index_files{bot}
+			    && $_ ne $index_files{pic}
+			    && $_ ne $index_files{thumb}, readdir THEME_DIR);
+    # attach it to the hash
+    $index_files{other} = \@theme_files;
+}
+
+# status variables
+my ($total_skipped, $total_processed, $total_cached, $total_displayed,
+    $total_dirs) = (0, 0, 0, 0, 0);
+
+# build the complex, sophisticated directory structure
+my $dirs = &build_dir_list($recurse_level,
+			   [ map (File::Spec->rel2abs($_), @ARGV) ] );
+
+# process the directories as specified
+foreach (keys %$dirs) {
+    my @results = &do_1_dir($_, $dirs->{$_}); # $dir, [$parentdir, @subdirs]
+
+    # add up the results
+    if (@results) {        # this directory processed correctly
+	$total_skipped   += $results[0];
+	$total_processed += $results[1];
+	$total_cached    += $results[2];
+	$total_displayed += $results[3];
+	$total_dirs++;
+    }
+}
+
+# all done!
+&print_status_totals($total_processed, $total_skipped, $total_cached,
+		     $total_displayed, $total_dirs) if ($verbose > -2);
+
+
+############
+# functions
+############
+
+#######
+# usage: prints usage and quits
+#######
+sub usage () {
+
+    print <<"USAGE";
+
+Usage: $0 [-v] [-q] [-r [-l level]] [-b quality] [-o output-dir [-p strip-level] [-s server]] [-t theme] dir1 [dir2 [dir3] ...]
+
+Webgallery takes a list of directories filled with images and creates
+some thumbnails and HTML to show off your work. HTML and thumbnails
+are created within each directory. See the file README for details.
+
+$my_name, Version $my_version, Copyright (C) 2000  Adam Goode
+$my_name comes with ABSOLUTELY NO WARRANTY.
+This is free software, and you are welcome to redistribute it under
+the conditions of the GNU General Public License as published by the
+Free Software Foundation; either version 2 of the License, or (at your
+option) any later version.
+
+USAGE
+
+    exit 0;
+}
+
+
+#######
+# print_banner: prints info banner
+#######
+sub print_banner () {
+
+    print "This is $my_name, Version $my_version\n";
+
+}
+
+
+
+#######
+# build_dir_list: reads in the command line, and returns a hash that has as
+#                 keys directories to process, with values references to lists
+#                 containing the parent directory as the first element and
+#                 all subdirectories to process as the remaining elements
+#
+# inputs: $recurse_level: how far down to recurse
+#         $dirs: a reference to the directories to process
+# returns: reference to that tricky hash mentioned above
+#######
+sub build_dir_list ($\@) {
+    my ($recurse_level, $dirs) = @_;
+
+   
+    # this seems tricky, but it's simple
+
+    # first, build a separate hash for each directory given
+    my @hashes;
+    foreach (@$dirs) {
+	push @hashes, &recurse_dir($_, $recurse_level);
+    }
+
+    return undef unless @hashes;  # if it didn't get anything, return
+
+    # then, merge these hashes into one hash
+    my $the_hash = pop @hashes;            # get the first hash
+    while (@hashes) {
+	my $hash2 = pop @hashes;           # get another hash
+	foreach (keys %$hash2) {
+	    if (defined $the_hash->{$_}) {     # if it's in the hash,
+		unless (defined $the_hash->{$_}->[0]) { # parentdir not there
+		    $the_hash->{$_}->[0]            # put it there from hash2
+			= $hash2->{$_}->[0];
+		}                            # otherwise, it's there already
+		if (@{ $the_hash->{$_} } < @{ $hash2->{$_} }) {
+		    $the_hash->{$_}->[1]     # set subdirs correctly
+			= $hash2->{$_}->[1];
+		}
+	    }
+	    else {
+		$the_hash->{$_} = $hash2->{$_};  # the hash needs hash2's entry
+	    }
+	}	    
+    }
+    return $the_hash;          # return it
+}
+
+
+
+#######
+# recurse_dir: travels down the directory, building this weird hash seen above
+#
+# inputs: $dir: the directory to examine
+#         $recurse_level: where we're at
+#         $parentdir: the name of what's just above (or undef)
+# returns: wacko hash reference
+#######
+sub recurse_dir ($$:$) {
+    my ($dir, $recurse_level, $parentdir) = @_;
+
+    my $the_hash;
+ 
+    # make sure it's a valid directory
+    unless (-d $dir) {
+	print "*** Skipping non-directory \'$dir\'\n";
+	return undef;
+    }
+
+    # read in the dirs (not $thumbdir or dotfiles)
+    opendir DIR, $dir or warn "Can't open $dir: $!";
+    my @subdirs = grep(-d "$dir/$_"
+		       && !/^\./ && $_ ne $thumbdir, readdir DIR);
+    closedir DIR;
+    
+    
+
+
+    # return if we're done (recursion 0 or no more subdirectories)
+    if ($recurse_level == 0) {
+	@subdirs = ();
+    }
+
+    $the_hash = { "$dir" => [ $parentdir, @subdirs ] };
+
+    # otherwise, we're at level 1 or greater
+
+    # go for each one, saving the results
+    foreach (@subdirs) {
+	%$the_hash = (%$the_hash,   # tricky hash merge
+		      %{ &recurse_dir("$dir/$_", $recurse_level-1, $dir) });
+    }
+    return $the_hash;             # whew!
+}
+
+
+
+
+
+#######
+# do_1_dir: process one directory
+#
+# inputs: $dir: the directory to examine
+#         a reference to a list containing:
+#            $parentdir: the parent directory (if defined)
+#            @subdirs: the names of the directories below
+# returns: ($skipped, $processed, $cached, $displayed) or undef if nothing done
+#######
+sub do_1_dir ($\@) {
+    my $dir = $_[0];
+    my ($parentdir, @subdirs) = @{ $_[1] };     # reference to list
+    
+    # okay, we're good, let's go
+    print "*** Work beginning on \'$dir\'...\n" if ($verbose > -2);
+    
+    my ($skipped, $processed, $cached, $displayed) = (0, 0, 0, 0);
+
+
+    eval {           # catches die
+	# pass 1: build thumbnails
+	print " ** Pass 1: " if ($verbose > -1);
+	($skipped, $processed, $cached)
+	    = &build_thumbnails($dir, $thumbdir);
+	
+	# pass 2: write html index
+	print " ** Pass 2: " if ($verbose > -1);
+	$displayed = &write_index($dir, $thumbdir, 5, 2, 2,
+				  $parentdir, @subdirs);
+	
+	if ($verbose > 0) {
+	    &print_status($processed, $skipped, $cached, $displayed);
+	}
+	print "\n" if ($verbose > -1);
+    };
+    if ($@) {          # something went awry
+	warn $@;
+	return undef;
+    }
+    
+    # nothing went awry!
+    return ($skipped, $processed, $cached, $displayed);
+}
+
+
+
+
+#######
+# build_thumbnails: creates thumbnails using imagemagick
+#
+# inputs: $dir: the directory to examine
+#         $thumbdir: the name of the subdirectory to create
+# returns: (the number of files skipped,
+#           the number of files processed,
+#           the number of files cached)
+#######
+sub build_thumbnails ($$) {
+    my ($dir, $thumbdir) = @_;
+    if ($output_dir) {
+	my @split_dir = File::Spec->splitdir($dir);
+	my $stripped_dir =
+	  File::Spec->catdir(@split_dir[$strip_level..$#split_dir]);
+	
+	$thumbdir = "$output_dir/$stripped_dir/$thumbdir";
+    }
+    else {
+	$thumbdir = "$dir/$thumbdir";
+    }
+    my %images;              # hash of image filenames and filesizes
+
+    my ($skipped, $processed, $cached) = (0, 0, 0);   # status counts
+
+    $| = 1;            # flush status
+
+
+    # read in the files in the directory, store the mtimes in a hash
+    opendir DIR, $dir or die "Can't open $dir: $!";
+
+    my @files = grep (-f "$dir/$_"
+		      && !($_ eq "$index_file" || $_ eq "$index_file.OLD"),
+		      readdir DIR);  # read in all the files (except index)
+    foreach (@files) {
+	$images{$_} = (stat("$dir/$_"))[9]; # mtime stored as value to filename
+    }
+	
+    closedir DIR;
+
+    print "Generating thumbnails... " if ($verbose > -1);
+
+
+    # make the thumbnails directory
+    unless (-d $thumbdir) {
+	my @split_path = File::Spec->splitdir($thumbdir);
+	my (@partial_path, $partial_path);
+	do {
+	    push @partial_path, shift @split_path;
+	    $partial_path = File::Spec->catdir(@partial_path);
+	    mkdir "$partial_path", 0777;
+	} while (@split_path);
+    }
+    die "Can't make directory $thumbdir: $!" unless (-d $thumbdir);
+
+    # make sure that the thumbnail directory doesn't have any extra files
+    opendir THUMBS, $thumbdir or die "Can't open $thumbdir: $!";
+    my @oldthumbs = grep (-f "$thumbdir/$_", readdir THUMBS);
+    closedir THUMBS;
+
+    foreach (@oldthumbs) {
+	# first, get the name of the file without the extension
+	/(.*)(\..*)$/;  # the filename, minus the extension
+	my $basename = $1;
+
+	# next, delete it if it's gone from the main directory
+	unless (defined $images{$basename}) {
+	    unlink "$thumbdir/$_" or die "Can't unlink $thumbdir/$_: $!";
+	    next;            # we're done with this file
+	}
+
+	# then, if the thumbnail (or info) file has a different modification
+	# date than the corresponding file in the parent directory, 
+	# assume that one of the two files have changed, and the one in the
+	# thumbnail directory should be removed
+	my $thumbinfo = (stat "$thumbdir/$_")[9]; # mtime
+	unless ($thumbinfo == $images{$basename}) {
+	    unlink "$thumbdir/$_" or die "Can't unlink $thumbdir/$_: $!";
+	}
+    }
+
+
+    # make the thumbnails
+    print "\n" if ($verbose > 0);
+    foreach (sort keys %images) {
+	print "    $_... " if ($verbose > 0);
+	
+	# Skip if both thumbnail and info are there (we know they are right)
+	# Other files are ignored, because these are the only files for 
+	# making thumbnails
+	if (-e "$thumbdir/$_.jpg" && -e "$thumbdir/$_.info") {
+	    print "~" if ($verbose == 0);
+	    print "cached.\n" if ($verbose > 0);
+	    $cached++;
+	    next;
+	}
+	# Otherwise, move on, and both thumbnail and info will be rewritten
+
+	my $i;
+
+	# start the Magick (or clear things)
+	my $image = Image::Magick->new;
+
+	# Read
+	my $index = rindex $_, ".";
+	my $ext = substr $_, $index;
+
+	if (defined $skip_files{lc($ext)}) {
+	    $i = "In skip file list";
+	}
+	else {
+	    $i = $image->Read("$dir/$_");
+	}
+
+	if ("$i") {            # error?
+	    print "!" if ($verbose == 0);
+	    if ($verbose == 1) {
+		print "skipping.\n";
+	    }
+	    elsif ($verbose > 1) {
+		print "skipping: $i\n";
+	    }
+	    $skipped++;
+	    next;
+	}
+	
+	# Write info to .info file (for eliminating a slow re-read later)
+	open INFOFILE, ">$thumbdir/$_.info"
+	    or die "Can't open $thumbdir/$_.info for writing: $!";
+	my ($w, $h) = $image->Get('width','height');
+	print INFOFILE "$w" . "x" . "$h\n";
+	my $size = (-s "$dir/$_") / 1024;
+	printf INFOFILE ("%.1f KB\n", $size);
+	close INFOFILE;
+	
+	# Scale
+        my $newHeight= 426;
+        my $newWidth= $newHeight * $w / $h;
+	$i = $image->Scale(geometry=>"${newWidth}x${newHeight}");
+	warn "$i" if "$i";
+
+	# Write (as jpeg always, and just the first page)
+	$i = $image->[0]->Write(filename=>"$thumbdir/$_.jpg",
+				quality=>$quality);
+	warn "$i" if "$i";
+
+	# Set timestamps of thumbnail and info files to the same as the file
+	my $time = $images{$_};
+	utime $time, $time, "$thumbdir/$_.jpg", "$thumbdir/$_.info";
+
+	$processed++;
+	print "#" if ($verbose == 0);
+	print "done.\n" if ($verbose > 0); # with this file's thumbnail
+    }
+    print "\n" if ($verbose > 1 || $verbose == 0);
+
+    return ($skipped, $processed, $cached);
+}
+
+
+
+#######
+# write_index: writes the HTML index
+#
+# inputs: $dir: the name of the directory to examine
+#         $thumbdir: the name of the thumbnails subdirectory
+#         $width: the number of columns in the HTML table
+#         $border: the size of the border in the HTML table
+#         $cellspacing: the cellspacing in the HTML table
+#         $parentdir: the name of the parent directory (if defined)
+#         @subdirs: a list of lower directories
+# returns: the number of pictures that appear on the index page
+#######
+sub write_index ($$$$$$@) {
+    my ($dir, $thumbdir, $width, $border, $cellspacing,
+	$parentdir, @subdirs) = @_;
+    my $index;
+    my $dest_thumbdir;
+
+    if ($output_dir) {
+	my @split_dir = File::Spec->splitdir($dir);
+	my $stripped_dir =
+	  File::Spec->catdir(@split_dir[$strip_level..$#split_dir]);
+	
+	$index = "$output_dir/$stripped_dir/$index_file";
+	$dest_thumbdir = "$output_dir/$stripped_dir/$thumbdir";
+    }
+    else {
+	$index = "$dir/$index_file";
+	$dest_thumbdir = "$dir/$thumbdir";
+    }
+    my $the_time = gmtime(time);      # what time is it?
+
+    my $displayed = 0;
+
+    # figure out the name of the directory for the HTML
+    my $dirname = (File::Spec->splitdir(File::Spec->rel2abs($dir)))[-1];
+
+    # move the old index out of the way
+    if (-e $index) {
+	copy("$index", "$index.OLD") or die "Can't backup $index: $!";
+    }
+
+    print "Generating \'$index\'...\n" if ($verbose > -1);
+
+    # all right, ready to clobber index
+    open INDEX, ">$index" or die "Can't open $index for writing: $!";
+
+    # gphoto themes require that files in the theme directory other than
+    # the 4 standard ones be copied directly into the target directory;
+    # this will be copied into the thumbnails directory, because it's
+    # consistent with what has been done before
+
+    # produce the HTML string of directories
+    my $dirs_html = "";
+    if (defined $parentdir) {
+	my $baseparentdir =
+	  (File::Spec->splitdir(File::Spec->rel2abs($parentdir)))[-1];
+	$dirs_html .=
+	    qq (<p><a href="../">Up to $baseparentdir</a></p>);
+    }
+    if (@subdirs) {
+	$dirs_html .= "<ul>";
+	foreach (sort @subdirs) {
+	    my $this_dir = (File::Spec->splitdir(File::Spec->rel2abs($_)))[-1];
+	    my $this_dir_uri = new URI;
+	    $this_dir_uri->path($this_dir . "/");
+	    $dirs_html .=
+		qq (<li><a href="$this_dir_uri">$this_dir</a></li>);
+	}
+	$dirs_html .= "</ul>";
+    }
+
+    # copy the other files into the thumbnails directory
+    foreach (@{$index_files{other}}) {
+	copy("$theme/$_", "$dest_thumbdir/$_")
+	    or die "Can't copy $_ to $dest_thumbdir: $!";
+    }
+    
+    # write the preamble
+    open INDEX_INPUT, "$theme/$index_files{top}"
+	or die "Can't open $theme/$index_files{top}: $!";
+    # read in the theme file, make the substitutions
+    {
+	local $/;
+	undef $/;                   # slurp!
+	$_ = <INDEX_INPUT>;
+
+	s/#GALLERY_NAME#/$dirname/g; 
+	s/#GALLERY_INDEX#/$index_file/g; 
+	s/#GALLERY_VERSION#/$my_name $my_version/g;
+	s/#THUMBNAIL_DIR#/$thumbdir/g;
+	s/#DATE#/$the_time/g; 
+
+	print INDEX;
+    }
+    close INDEX_INPUT;
+    print INDEX "$dirs_html";
+        
+
+    # read in the thumbnails that end in .jpg
+    opendir DIR, "$dest_thumbdir" or die "Can't open $dest_thumbdir: $!";
+    my @files = grep (-f "$dest_thumbdir/$_" && /(.jpg)$/,
+		      readdir DIR);  # read in all the files
+    closedir DIR;
+    
+    if (@files) {
+	print INDEX qq(<table border="$border" cellspacing="$cellspacing">);
+    }
+
+    # open the theme files
+    open THUMBNAIL_INPUT, "$theme/$index_files{thumb}"
+	or die "Can't open $theme/$index_files{thumb}: $!";
+    open PICTURE_INPUT, "$theme/$index_files{pic}"
+	or die "Can't open $theme/$index_files{pic}: $!";
+
+    my $width_pos = 0;
+    
+    # now, for each image, write out a cell with a bit of information below it
+    @files = sort @files;
+    $| = 1;    # flush on!
+    for (my $pos = 0; $pos < @files; $pos++ ) {
+	$_ = $files[$pos];
+
+	my $number = $pos + 1;
+
+	# the thumbnails always have an extra ".jpg", so find out the real file
+	my $rf = substr $_, 0, -4;
+
+	# skip if there's a thumbnail that doesn't belong
+	unless (-e "$dir/$rf" && "$dir/$rf" ne "$index"
+                    	      && "$dir/$rf" ne "$index.OLD") {
+	    next;
+	}
+
+	# figure out the next and previous files
+	my $rf_next = ($pos+1 < @files)       # not last  ? next : undef
+	    ? substr $files[$pos+1], 0, -4 : undef;
+	my $rf_prev = ($pos != 0)             # not first ? prev : undef
+	    ? substr $files[$pos-1], 0, -4 : undef;
+
+	print "    adding $rf... " if ($verbose > 0);
+
+	# this URI stuff is necessary to properly escape the URIs
+	my $uri = new URI;
+	my $uri_rf = new URI;
+	my $uri_html = new URI;
+	my $uri_html_next = new URI;
+	my $uri_html_prev = new URI;
+	{
+	    # suppress warnings of URI
+	    local $SIG{__WARN__} = sub { print @_ if ($verbose > 1) };
+	    $uri->path($_);                    # the thumbnail
+	    $uri_html->path("$rf.html");       # the html file
+
+	    if ($output_dir) {
+		# some trickery, to properly write the full path
+		my $possible_userid;
+		my @dir = File::Spec->splitdir($dir);
+		
+		# convert "userid/public_html/items" to "~userid/items"
+		# (either public_html or public.html will match)
+		while(@dir) {
+		    $possible_userid = shift @dir;
+		    if ($dir[0] =~ /public.html/) {
+			shift @dir;
+			$uri_rf->path(File::Spec->catdir("",
+							 "~$possible_userid",
+							 @dir) .
+				      "/$rf");
+			$uri_rf = $uri_rf->abs($server) if $server;
+			last;
+		    }
+		}
+	    }
+	    else {
+		$uri_rf->path("../$rf");                # the real image
+	    }
+	    
+	    # the next and previous images
+	    if (defined $rf_next) {
+		$uri_html_next->path("$rf_next.html");  # the next file
+	    }
+	    else {
+		$uri_html_next->path("../$index_file");
+	    }
+	    if (defined $rf_prev) {
+		$uri_html_prev->path("$rf_prev.html");  # the previous file
+	    }
+	    else {
+		$uri_html_prev->path("../$index_file");
+	    }
+	}
+
+	# get some info from the .info file
+	open INFOFILE, "$dest_thumbdir/$rf.info"
+	    or die "Can't open infofile: $dest_thumbdir/$rf.info: $!";
+
+	my $info = "";
+
+	# take this file and put it into $info, with <br />s added
+	if (defined ($_ = <INFOFILE>)) {
+	    chomp;
+	    $info .= "$_";              # this one doesn't have <br />
+	}
+	while (<INFOFILE>) {
+	    chomp;                      # you love chomp!
+	    $info .= ", $_";        # these have <br />
+	}	    
+	close INFOFILE;
+
+	# start writing the HTML table
+	if ($width_pos % $width == 0) {
+	    print INDEX "<tr valign=\"baseline\">\n";
+	}
+
+	seek THUMBNAIL_INPUT, 0, 0;     # re-read the file
+	{
+	    local $/;
+	    undef $/;                 # slurp!
+	    $_ = <THUMBNAIL_INPUT>;
+
+	    # get the extension from the file to process
+	    my $rfext  = "";
+	    my $rfindex = 0;
+	    $rfindex = rindex $rf, ".";
+	    $rfext = substr $rf, $rfindex;
+
+	    # make the substitutions
+	    s/#GALLERY_INDEX#/..\/$index_file/g; 
+
+	    # insert HTML code that links directly to some files
+	    if (defined $direct_links{lc($rfext)}) {
+		s/#THUMBNAIL#/<a href="$uri_rf">
+		    <img src="$thumbdir\/$uri" height=120 alt="$rf" \/><\/a>/g;
+		s/#THUMBNAIL_LINK#/$uri_rf/g;
+	    }
+	    else {
+		s/#THUMBNAIL#/<a href="$thumbdir\/$uri_html">
+		    <img src="$thumbdir\/$uri" height=120 alt="$rf" \/><\/a>/g;
+		s/#THUMBNAIL_LINK#/$thumbdir\/$uri_html/g;
+	    }
+	    s/#THUMBNAIL_DIR#/$thumbdir/g;
+	    s/#THUMBNAIL_FILENAME#/$rf/g;
+	    s/#THUMBNAIL_INFO#/$info/g;
+	    s/#THUMBNAIL_NUMBER#/$number/g;
+	    
+	    # some other substitutions
+	    s/#PICTURE_FILENAME#/$rf/g;
+	    s/#PICTURE_NUMBER#/$number/g;
+
+	    # write out a cell
+	    print INDEX "<td>$_</td>\n";
+	}	    
+
+	# now, write the HTML file
+	seek PICTURE_INPUT, 0, 0;       # start from the beginning
+	{
+	    local $/;
+	    undef $/;                   # slurp!
+	    $_ = <PICTURE_INPUT>;
+
+	    # open individual picture HTML
+	    open PICFILE, ">$dest_thumbdir/$rf.html"
+		or die "Can't open $dest_thumbdir/$rf.html for writing: $!";
+
+	    # substitute!
+	    s/#GALLERY_NAME#/$dirname/g; 
+	    s/#GALLERY_INDEX#/..\/$index_file/g; 
+	    s/#GALLERY_VERSION#/$my_name $my_version/g;
+	    s/#DATE#/$the_time/g; 
+
+	    s/#PICTURE#/<a href="$uri_rf"><img width=1000 src="$uri_rf" \/><\/a>/g; 
+	    s/#PICTURE_URL#/$uri_rf/g; 
+	    s/#PICTURE_FILENAME#/$rf/g; 
+	    s/#PICTURE_NUMBER#/$number/g; 
+	    s/#PICTURE_NEXT#/$uri_html_next/g; 
+	    s/#PICTURE_PREVIOUS#/$uri_html_prev/g;
+	    s/#PICTURE_INFO#/$info/g;
+
+	    # other substitutions
+	    s/#THUMBNAIL_DIR#/$thumbdir/g;
+	    s/#THUMBNAIL_FILENAME#/$uri/g;
+	    s/#THUMBNAIL_NUMBER#/$number/g;
+	    
+	    # write!
+	    print PICFILE;
+
+	    close PICFILE;
+	}
+
+	$width_pos++;
+	if ($width_pos % $width == 0) {
+	    print INDEX "</tr>\n";
+	}
+	$displayed++;
+	print "done.\n" if ($verbose > 0); # with this file's HTML
+    }
+    # put in the last </tr> if necessary
+    if ($width_pos % $width != 0) {
+	print INDEX "</tr>\n";
+    }
+    
+    if (@files) {
+	print INDEX qq(</table>\n);
+    }
+
+    close THUMBNAIL_INPUT;
+    close PICTURE_INPUT;
+
+
+    # cool, now finish off the html file, and we're done for now
+    open INDEX_INPUT, "$theme/$index_files{bot}"
+	or die "Can't open $theme/$index_files{bot}: $!";
+    {
+	local $/;
+	undef $/;              # yummmmm...
+	
+	$_ = <INDEX_INPUT>;
+
+	s/#GALLERY_NAME#/$dirname/g; 
+	s/#GALLERY_INDEX#/$index_file/g; 
+	s/#GALLERY_VERSION#/$my_name $my_version/g;
+	s/#THUMBNAIL_DIR#/$thumbdir/g;
+	s/#DATE#/$the_time/g; 
+
+	print INDEX;
+    }
+    close INDEX_INPUT;
+
+    print "\n" if ($verbose > 1);
+
+    return $displayed;
+}
+
+
+
+#######
+# print_status: displays the stats after single directory
+#######
+sub print_status ($$$$) {
+    my ($processed, $cached, $skipped, $displayed) = @_;
+
+    # fairly messy code, but I hate incorrect plurality
+    # let me know if you can do this better
+
+    print " ** Directory stats: $processed file";
+    unless ($processed == 1) {
+	print "s";
+    }
+    print " processed, $skipped file";
+    unless ($skipped == 1) {
+	print "s";
+    }
+    print " cached, $cached file";
+    unless ($cached == 1) {
+	print "s";
+    }
+    print " skipped,\n                     $displayed picture";
+    unless ($displayed == 1) {
+	print "s";
+    }
+    print " put in gallery.\n";
+}
+
+#######
+# print_status_totals: displays the stats after the entire run
+#######
+sub print_status_totals ($$$$$) {
+    my ($processed, $cached, $skipped, $displayed, $dirs) = @_;
+
+    # fairly messy code, but I hate incorrect plurality
+    # let me know if you can do this better
+
+    print "*** Totals: $processed file";
+    unless ($processed == 1) {
+	print "s";
+    }
+    print " processed, $skipped file";
+    unless ($skipped == 1) {
+	print "s";
+    }
+    print " cached, $cached file";
+    unless ($cached == 1) {
+	print "s";
+    }
+    print " skipped in\n            $dirs director";
+    if ($dirs == 1) {
+	print "y.";
+    }
+    else {
+	print "ies.";
+    }
+    print "\n            $displayed picture";
+    unless ($displayed == 1) {
+	print "s";
+    }
+    print " put in galler";
+    if ($dirs == 1) {
+	print "y.";
+    }
+    else {
+	print "ies.";
+    }
+    print "\n";
+}
