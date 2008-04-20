@@ -1,3 +1,5 @@
+Webgallery 0.1
+
 Webgallery is a tool for showing pictures and videos on the web.
 
 This packages needs perlmagick and liburi-perl to run.
