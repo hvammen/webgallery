@@ -1,0 +1,9 @@
+Webgallery is a tool to represent pictures and videos in a webpage
+
+This packages needs perlmagick and liburi-perl to run.
+
+To install do:
+
+ 1. mkdir b-linux
+ 2. cd b-linux
+ 3. cmake ..
